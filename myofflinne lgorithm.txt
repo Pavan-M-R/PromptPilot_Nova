@@ -1,0 +1,2538 @@
+[21-08-2025 19:08] Pavan: Nice — I hear you. You want not a rigid, rulebook-based system but a genuinely open-world, dynamic, self-extending pipeline that can handle inputs outside your predefined roles/domains and still produce the best possible long, structured prompt and persona for the LLM to act on. Below I’ll give you a full, production-grade design: architecture, algorithms, concrete pseudocode, LLM meta-prompts, thresholds, data schemas, fallbacks, learning loop, and example runs (including "write a code for login page" and an out-of-distribution query). This is intentionally exhaustive so you can implement it end-to-end.
+
+Overview — what “dynamic” means here
+
+Open-world intent recognition: treat intent detection as open-set problem — don’t force inputs into pre-labeled buckets. Instead infer intent with embeddings + LLMs, and create new intent schemas on the fly when necessary.
+
+Dynamic persona synthesis: when an existing persona doesn’t match well, synthesize a persona from the user input (expertise level, voice, goals, constraints, examples) using an LLM composer.
+
+Schema-first prompt building: infer an output schema (JSON or document structure) from the input, then produce a long, structured prompt that forces the target LLM to return the requested schema/content.
+
+Retrieval & enrichment: augment prompt with relevant domain/context via RAG (vector search) so the prompt is informed even for niche topics.
+
+Self-checking & orthogonal verification: the optimizer asks the LLM to produce a plan, checks it against the schema, and runs validator prompts to reduce hallucination.
+
+Lifelong learning: capture unknown inputs, cluster them, create new labelled intents/personas, and use semi-supervised training or human-in-the-loop to expand the system.
+
+
+High-level system architecture (textual)
+
+Client/UI
+   └─> API Gateway (auth, rate limits)
+         └─> Orchestrator
+                ├─ Preprocess
+                ├─ Embed & OOD Detector
+                ├─ Intent Induction (LLM + clustering)
+                ├─ Slot/Schema Synthesizer (LLM)
+                ├─ Persona Composer (LLM + retrieval)
+                ├─ Prompt Architect (rule template + LLM polish)
+                ├─ RAG Enricher (vector DB retrieval)
+                ├─ Optimizer & Self-Validator (structured checks)
+                ├─ Feedback/Telemetry & Learning Pipeline
+                └─> Response (prompt + metadata)
+
+Core concepts & data shapes
+
+Core output (what backend returns to frontend)
+
+{
+  "intent": {"name":"generate_code","confidence":0.93, "type":"induced"},
+  "persona": {"id":"dynamic:v1", "name":"Helpful Software Engineer", "voice":"concise, secure-first, pragmatic", "capabilities":["frontend","backend","security"], "examples": ["..."]},
+  "schema": { /* JSON schema for expected output */ },
+  "optimized_prompt": "long structured prompt ...",
+  "metadata": { "emb_dist":0.12, "routes":["local_llm"], "assumptions":[...], "clarifications":[...] }
+}
+
+Full algorithm — step by step (detailed)
+
+Stage 0 — Config & resources
+
+Vector DB (FAISS/Milvus/Weaviate) storing:
+
+persona exemplars (embeddings + metadata)
+
+prior prompts & successes
+
+knowledge context docs (domain packs)
+
+
+Embedding model (local SBERT or OpenAI embeddings)
+
+Small local classifier (MiniLM ONNX) for fast heuristics (optional)
+
+LLMs: prefer a strong model (cloud) for induction/composition; optionally a local LLM for privacy.
+
+
+Stage 1 — Ingest & Preprocess
+
+1. Receive user_text + optional context (user profile, history).
+
+
+2. Clean & normalize: trim, unicode normalize, sanitize PII (hash or redact).
+
+
+3. Language detect.
+
+
+4. Quick safety filter (regex & small classifier) — block illegal/high-risk content early.
+
+
+
+Stage 2 — Embed & Out-of-Distribution Detection
+
+1. Compute semantic embedding e_user.
+
+
+2. Query vector DB for nearest neighbors among known-intents / persona exemplars.
+
+
+3. Compute dist = min_cosine_dist(e_user, neighbors).
+
+
+4. If dist < τ_known → treat as match to existing intent/persona (use neighbor meta).
+
+τ_known ~ 0.25–0.35 (tune).
+
+
+
+5. Else → classify as Open-World / Potential OOD.
+
+
+
+Why: Embeddings let us quickly see whether the input semantically matches prior examples. If it does not, we induce rather than force-fit.
+
+Stage 3 — Intent Induction (dynamic)
+
+If OOD:
+
+1. Few-shot LLM induction: call LLM with meta-prompt to generate:
+
+Canonical intent name (short slug).
+
+Short human-readable description.
+
+Intent type (generate, analyze, convert, fix, roleplay, specify, etc.)
+
+Suggested output forms (list).
+
+Suggested critical slots (list of keys that must be filled).
+
+Confidence / rationale.
+
+
+
+2. Optionally produce 3–5 example user utterances for this induced intent (for later clustering / labelling).
+
+
+3. Index e_user + induced intent into vector DB as a new exemplar (tag unverified) for future reuse.
+
+
+
+Example induction meta-prompt (send to LLM):
+
+You are an intent engineer. A user said: "<user_text>". 
+Infer a compact intent slug, a 1-sentence description, list output types (e.g., "code", "slides", "summary"), and 3 critical slots to complete the task. 
+Return JSON: {"intent":"...", "description":"...", "output_types":["..."], "critical_slots":["..."]}.
+Explain briefly why.
+
+Stage 4 — Slot & Schema Synthesis
+
+Use the LLM to produce a formal output schema (prefer JSON Schema) that captures the structure the user likely expects. For example, for code generation, the schema might expect fields: language, files[], instructions, security_notes.
+
+Meta-prompt:
+
+Given the intent <intent> and user text "<user_text>", generate a JSON Schema that represents a complete and useful output for this task, including field descriptions and recommended lengths (where applicable). Prioritize machine-readability and enforceable checks.
+Return only valid JSON Schema.
+
+Why schema-first: it forces the optimizer and the downstream LLM to produce predictable outputs and makes validation/auto-tests easier.
+
+Stage 5 — Persona Composer (dynamic)
+
+If embedding matched a persona exemplar → reuse persona (maybe adapt traits). If not:
+
+1. Compose a persona via LLM: produce persona_card with fields:
+
+name, expertise_tags, voice (style tokens), goals, do_not_do, example_phrases (how persona speaks), best_practices (domain checks), capabilities (what it can assume/do).
+
+
+
+2. The LLM uses:
+
+user_text,
+
+detected intent,
+
+retrieved context docs (RAG),
+
+nearest persona exemplars (as few-shot examples).
+
+
+
+3. The persona is saved to vector DB with verified:false for review/usage.
+
+
+
+Persona meta-prompt:
+
+Create a persona for fulfilling this request: "<user_text>". Provide name, 2-line voice description, skills, 5 short behavior rules (do's and don'ts), and 3 short example replies. Keep it compact and actionable for an LLM to adopt.
+Return JSON.
+
+Stage 6 — Retrieve Relevant Context (RAG Enrichment)
+
+1. Use intent & query to retrieve supporting docs from vector DB (domain packs, previous similar prompts, FAQ, code snippets).
+
+
+2. Select top-K (K=3–5) and include condensed summaries (or citations) into the prompt.
+
+
+
+This avoids hallucination and grounds the prompt in evidence.
+
+Stage 7 — Prompt Architecture (synthesis)
+
+Now assemble the long, structured meta-prompt using templated sections plus dynamic content:
+
+Minimum sections:
+
+1. System role/persona (use persona_card).
+
+
+2. High-level objective.
+
+
+3. Context & retrieved references.
+
+
+4. Exact requirements (from schema + critical slots).
+
+
+5. Audience, tone, and success metrics.
+
+
+6. Constraints & prohibited content.
+
+
+7. Step-by-step plan for the model to follow (explicit chain-of-thought-like steps).
+
+
+8. Output schema/instructions for formatting (e.g., “Return JSON following the schema exactly”).
+
+
+9. Assumptions and clarifications.
+
+
+10. Self-check rubric & tests.
+
+
+
+Important: This prompt is not the final output yet — it’s the instruction to the target LLM that will produce the actual content.
+
+Example template (short)
+
+[SYSTEM ROLE]
+You are {persona.name}: {persona.voice}. Follow best_practices: {persona.best_practices}.
+
+[OBJECTIVE]
+{description_of_intent}
+
+[CONTEXT]
+{user_text}
+{RAG_summaries}
+
+[REQUIREMENTS] 
+- Output must follow this JSON Schema: {json_schema}
+- Must include: {critical_slots}
+- Tone: {tone}
+
+[PLAN]
+1) Clarify ambiguous points (list them).
+2) Produce a structured outline matching schema.
+3) Fill each section with concise, tested content.
+4) Run self-checks described below and include 'verification' field.
+
+[SELF-CHECK]
+- Validate JSON against schema.
+- Include short explanation for each key choice.
+
+Stage 8 — LLM Optimization & Multi-Stage Generation
+
+Use a multi-stage generation strategy for quality:
+
+1. Plan pass: Ask LLM to output an outline/plan only. Validate plan against schema & requirements; if missing critical slots, generate clarifying questions.
+
+
+2. Draft pass: Ask LLM to generate the full content following the plan and schema.
+
+
+3. Verification pass: Ask LLM (same or separate) to validate the output (e.g., validate_json_against_schema), produce a short verification object describing checks.
+
+
+4. Refine pass: If verification fails or low confidence → rerun small edits or provide explicit corrections.
+
+
+
+Why multi-pass? Reduces hallucination, yields more structured reliable outputs.
+
+Stage 9 — Clarify vs Assume
+
+If critical slots are missing and we are in strict mode, return those clarifying questions to the user.
+
+If fast_mode or user opted to continue, generate explicit assumptions (max 3) and include them in the prompt (tagged ASSUMPTIONS), and mark metadata assumptions_used:true.
+
+
+Stage 10 — Save & Learn
+
+Save the triplet (user_text, e_user, produced_intent_persona, schema, prompt, final_output, user_feedback) to dataset.
+
+Run automated clustering of unknown intents weekly; surface clusters to human reviewer for labeling. Add newly verified clusters to persona/intent DB.
+
+Optionally fine-tune a classifier or a small intent model with newly labeled data.
+
+
+Open-world / OOD mechanics (practical)
+
+Detection:
+
+Use embedding distance to nearest known exemplar OR use max softmax probability + ODIN/temperature-scaling on classifier. Even better: combine both signals (ensemble).
+
+If dist > τ_high, mark OOD. Thresholds initially chosen, then tuned.
+
+
+Behavior when OOD:
+
+Induce intent & schema via LLM (as above).
+
+Synthesize persona via LLM from scratch, seeded by nearest examples to give style guidance.
+
+Store these as candidate_intent/persona in vectordb with unverified tag.
+
+
+Meta-prompts & templates you can copy-paste
+
+Intent Induction (LLM)
+
+You are an expert intent engineer. User: "<USER_TEXT>"
+Produce JSON: {
+  "intent": "<short_slug>",
+  "description": "<one sentence>",
+  "type": "<generate|analyze|convert|fix|explain|roleplay|other>",
+  "output_examples": ["one-line example of expected outputs (max 3)"],
+  "critical_slots": ["slot1","slot2","slot3"]
+}
+Explain in one short line why you chose these.
+
+Persona Composer (LLM)
+
+Given intent "<intent>" and user input "<USER_TEXT>", create a persona JSON:
+{
+  "id": "dynamic:<uuid>",
+  "name": "Short Name",
+  "voice": "2-6 words describing tone",
+  "skills": ["skill1","skill2"],
+  "best_practices": ["rule1","rule2","rule3"],
+  "do_not": ["do_not_1"]
+}
+Return only JSON.
+
+Schema Synthesizer (LLM)
+
+Create a JSON Schema suitable for the desired output. Use concise field definitions and include example values. Output valid JSON Schema only.
+
+Plan-first generation (LLM)
+
+Use persona: <persona_card>. User: "<user_text>".
+Step 1: Output an Outline of sections that will be produced, mapping each section to schema fields.
+Return only an array of section objects: [{ "section":"", "schema_field":"" , "notes":"" }]
+
+Self-Validation (LLM)
+
+Given candidate output X and JSON Schema Y, produce:
+{ "valid": true/false, "errors": [...], "fixes": ["short list of changes to make"] }
+Return only JSON.
+
+Example run — "write a code for login page" (dynamic pipeline)
+
+1. preprocess → user_text unchanged.
+
+
+2. embed → finds nearest persona software_example (dist small) → not OOD.
+
+
+3. intent detection → generate_code (confidence 0.95).
+
+
+4. schema synthesizer → JSON Schema:
+
+
+
+{
+  "type":"object",
+  "properties":{
+    "language":{"type":"string"},
+    "files":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}},
+    "run_instructions":{"type":"string"},
+    "security_notes":{"type":"string"}
+  },
+  "required":["language","files"]
+}
+
+5. persona composer → Helpful Software Engineer (voice: secure-first).
+
+
+6. RAG → retrieve matching code snippets for login pages and secure password handling.
+
+
+7. Prompt architect builds long instruction with persona + schema + constraints.
+
+
+8. Multi-stage LLM generation:
+
+Plan pass: outline pages, files.
+
+Draft pass: returns language: "React + Node (Express)", files with src/Login.js, server/auth.js etc.
+
+Validate against schema → pass.
+
+
+
+9. Response returns optimized_prompt and final_output (structured).
+
+
+
+Frontend view (what user sees)
+
+Intent: generate_code
+
+Persona: Helpful Software Engineer
+
+Prompt: long structured instruction (as earlier)
+
+Action buttons: Generate Code (send prompt to code model), Edit Prompt, Regenerate, Show Details.
+
+
+Example run — OOD query: "Design an in-game ritual for a fictional sea cult that grants players temporary storm powers"
+
+This is outside typical code/marketing roles — dynamic system handles it:
+
+1. Embedding → no close match → OOD.
+
+
+2. Intent induction via LLM → intent: "create_fictional_ritual", type: creative_design, critical_slots: tone,mechanics,balance,safety (safety includes "no real-world harmful instructions").
+
+
+3. Persona synthesis → Mythcraft Game Designer, voice: evocative but safety-aware.
+
+
+4. Schema → fields: ritual_name, steps[], game_mechanics{duration,cost,effects}, lore_note, safety_flag.
+
+
+5. RAG → retrieve internal game design doc templates & mythology style examples.
+
+
+6. Build long prompt and generate creative ritual. Safety check ensures no real-world ritual instructions.
+
+
+7. Save as new exemplar for future queries.
+
+
+
+Pseudocode (integrated)
+
+function dynamic_build(user_text, context={}, policy):
+  pre = preprocess(user_text)
+  emb = embed(pre.text)
+  neighbors = vectordb.knn(emb, k=5)
+
+  if neighbors.min_dist < TAU_MATCH:
+    // reuse/augment
+    match = neighbors.top()
+    intent = match.intent
+    persona = match.persona
+  else:
+    // open-world induction
+    induced = LLM.intent_induction(pre.text)
+    intent = induced.intent
+    // save candidate
+    vectordb.insert(emb, metadata={intent:intent,verified:false})
+
+    persona = LLM.compose_persona(pre.text, induced)
+
+  schema = LLM.make_schema(intent, pre.text)
+  rag_docs = vectordb.retrieve_related(pre.text, topk=3)
+  persona_examples = vectordb.get_persona_examples(intent)
+
+  draft_prompt = assemble_prompt(persona, intent, schema, pre.text, rag_docs, context)
+  // multi-stage generate
+  plan = LLM.generate_plan(draft_prompt)
+  if plan.missing_critical:
+    if policy.strict: return clarifying_questions(plan.missing_critical)
+    else draft_prompt.add_assumptions(make_assumptions(plan.missing_critical))
+
+  candidate = LLM.generate_full(draft_prompt)
+  verification = LLM.validate(candidate, schema)
+  if not verification.valid:
+    candidate = LLM.refine(candidate, verification.fixes)
+
+  store_interaction(user_text, emb, intent, persona, schema, candidate, verification)
+  return {intent, persona, schema, optimized_prompt:draft_prompt, final_output:candidate, metadata:...}
+
+Implementation notes & recommended stack
+
+Embeddings: sentence-transformers (local) or OpenAI embeddings. Vector DB: FAISS (local) or Milvus/Weaviate (production).
+
+LLMs: OpenAI/Anthropic for induction & generation; local LLMs (Llama 3 family) for privacy-mode.
+
+Orchestration: FastAPI backend with async calls; queue optimizer tasks.
+
+Storage: Postgres + vector DB + S3 for storing generated artifacts.
+
+Observability: Collect emb_dist, intent_conf, generation_latency, user_feedback.
+
+Safety: config-driven policy adapter to block/transform dangerous tasks (especially OOD creative tasks involving real-world harm).
+
+
+Continuous learning & governance
+
+Human-in-the-loop: surface unverified induced intents/personas to a review dashboard.
+
+Auto-cluster: weekly cluster OOD examples; propose new labels to reviewer.
+
+Auto-train: periodically retrain a small intent classifier using verified labels for fast routing.
+
+Versioning: version persona templates and schema packs; run A/B on meta-prompts.
+
+
+Evaluation metrics
+
+Intent precision/recall vs verified labels
+
+Persona fidelity score (human-rated)
+
+Schema validation pass rate
+
+Downstream LLM output quality (human score or proxy heuristics, e.g., presence of required fields)
+
+Acceptance rate (users use prompt as-is)
+
+Time-to-first-good-output (latency)
+
+
+Practical thresholds & hyperparams (starting points)
+
+Embedding match threshold τ_known = 0.30 (cosine distance)
+
+Topk for RAG = 3
+
+Max assumptions when missing critical slots = 3
+
+Validation retries = 2
+
+Persona exemplar verification threshold for auto-accept = 5 positive user-uses
+
+
+Quick engineering checklist to build MVP
+
+1. Implement embed + vector DB and index ~100 persona exemplars and prior prompts.
+
+
+2. Implement LLM wrappers (intent induction, persona composer, schema synthesizer, generator).
+
+
+3. Assemble orchestrator that runs induction if no close neighbor.
+
+
+4. Provide UI with Details toggle for metadata and strict/fast mode switch.
+
+
+5. Implement feedback button (thumbs + reason) and storage.
+
+
+6. Weekly human review workflow.
+
+
+
+Final: Why this approach solves your core concern
+
+No forcing: you don’t shoehorn X inputs into Y roles — the system creates intent and persona when needed.
+
+Explainability: every induced intent/persona comes with a rationale and sample utterances.
+
+Safety + predictability: schema-first approach ensures the LLM output is verifiable and machine-checked.
+
+Extensibility: new intents & personas are learned from live data (semi-supervised), not hand-coded forever.
+
+Quality: multi-stage generation + RAG + verification increases output usefulness and reduces hallucination.
+
+
+
+---
+
+If you want, I’ll do one of the following next (pick one — I won’t ask again):
+
+1. Produce concrete code stubs / a single-file reference implementation of the dynamic induction + persona composer (Python + OpenAI calls) you can drop into your backend.
+
+
+2. Extend the zip I already gave you to replace the static persona + intent modules with the dynamic induction pipeline (LLM prompts, vector DB hooks, saving examples).
+
+
+3. Draft the exact database schema + vector DB indexing pipeline + recommended meta-prompts tuned for gpt-4o-mini so your team can implement quickly.
+
+
+
+Tell me which of the three you want me to produce right now and I’ll create it in this chat.
+[22-08-2025 08:38] Pavan: Hybrid Prompt-Generator System — Full Design & Algorithm (End-to-End)
+
+This document specifies a hybrid (offline + online) prompt-generation system that takes raw user input, detects intent and needs, selects an appropriate role/persona, and outputs a long, detailed, structured prompt. It operates offline by default for fast, private classification and slot-filling, and optionally invokes a local or cloud LLM to polish/expand the final prompt.
+
+
+---
+
+1) Goals & Non-Goals
+
+Goals
+
+Convert any raw input into a high-quality, structured prompt.
+
+Infer intent (task, domain, tone, audience, output form) offline.
+
+Extract slots (topic, goal, constraints, must-include, timeframe).
+
+Assign persona deterministically from rules + confidence.
+
+Assemble a long, comprehensive prompt with assumptions if info is missing.
+
+Optionally refine with an LLM (local or cloud) for naturalness and depth.
+
+Provide observability, privacy controls, cost control, and fallbacks.
+
+
+Non-Goals
+
+Building/serving a general knowledge base.
+
+Acting as the final content generator (this system creates prompts for an LLM).
+
+
+
+---
+
+2) High-Level Architecture
+
+┌────────────────────────┐
+│        Client/UI       │  (Web/CLI/IDE plugin)
+└───────────┬────────────┘
+            │ REST/IPC
+┌───────────▼────────────┐
+│     Orchestrator       │  (state machine & routing)
+└───────┬───────┬────────┘
+        │       │
+        │       │
+┌───────▼───┐ ┌─▼─────────────────────────────────────┐
+│ Offline   │ │   Online/Local LLM Optimizer Layer     │
+│ NLP Layer │ │  (local llama.cpp or cloud API:        │
+│           │ │   OpenAI/Anthropic/Gemini/Mistral)     │
+├───────────┤ └────────────────────────────────────────┘
+│ Normalizer│
+│ Lang-Detect│
+│ Intent Clf │
+│ Slot Extract│
+│ Safety Gate│
+└───────┬────┘
+        │
+┌───────▼─────────────────────┐
+│ Persona Engine (Rules+Scores)│
+└───────┬──────────────────────┘
+        │
+┌───────▼─────────────────────────────────────────────┐
+│ Prompt Renderer (Template + Token Budgeter + Schema)│
+└───────┬─────────────────────────────────────────────┘
+        │
+┌───────▼─────────────┐
+│ Output + Telemetry  │
+│ (Logs, Metrics, A/B)│
+└──────────────────────┘
+
+
+---
+
+3) Detailed Flow (When/Where/What Happens)
+
+Stage A — Input & Preprocessing (Offline)
+
+1. Receive input: user_text, optional context, target_model, constraints.
+
+
+2. Normalize:
+
+Trim whitespace; collapse repeated spaces.
+
+Canonicalize quotes/punctuation.
+
+Replace raw URLs with placeholders [[link:hash]] unless requested.
+
+
+
+3. Language detection (e.g., fastText/langid/spaCy):
+
+lang_code, confidence.
+
+If confidence < τ_lang, default to user profile language or English.
+
+
+
+4. Safety pre-filter (light offline rules): flag dangerous content early.
+
+If policy violation → return safe refusal scaffolding prompt (configurable).
+
+
+
+
+Artifacts produced: preprocessed_text, lang, safety_flags.
+
+
+---
+
+Stage B — Intent Detection (Offline first, LLM-assisted if needed)
+
+5. Local classifiers (CPU-friendly):
+
+task_types (multi-label): write/summarize/plan/analyze/classify/extract/translate/code/fix_code/design/brainstorm/explain/compare/roleplay/QA/evaluate/proofread/compose_email/testcases/create_prompt…
+
+domain (single best label): marketing/software/data_science/product/academia/legal/finance/healthcare/education/creative_writing/sales/ops/…
+
+tone: formal/concise/friendly/persuasive/technical/storytelling/neutral.
+
+audience: executive/technical/general/students/customers/investors.
+
+output_form: blog_post/spec/report/email/slides_outline/table/JSON/code_file/checklist/roadmap/prompt_pack/…
+
+length_target: short/medium/long (with words estimate).
+
+
+
+6. Scoring & thresholds:
+
+If top label score < τ_intent for any dimension → mark low confidence.
+
+
+
+7. Optional validator (only if low confidence): call LLM classifier (local tiny model or cheap cloud) to re-rank or confirm labels.
+
+
+
+Artifacts: intents = labels + confidences.
+
+
+---
+
+Stage C — Slot Extraction (Offline first, LLM-assisted if needed)
+
+8. Heuristic & NER extraction (spaCy/regex/dictionaries):
+
+topic / subject
+
+goal / purpose (“pitch investors”, “teach beginners”, etc.)
+
+constraints (word limits, citation style, format like Markdown/JSON, tone overrides)
+
+must_include bullets/keywords
+
+timeframe / scope (“Q4 2025”, “for EU market”)
+
+data_provided (quoted text, bullets, links)
+
+
+
+9. Criticality assessment:
+
+Given the task + output_form, compute critical_slots (e.g., for “investor deck”: raise amount, traction, market).
+
+
+
+10. If critical slots missing:
+
+Generate clarification questions (offline template) and also reasonable assumptions (short list) to proceed.
+
+If strict_mode=true, return questions to user instead; else proceed with assumptions.
+
+
+
+
+Artifacts: slots, clarifications[], assumptions[].
+
+
+---
+
+Stage D — Persona Assignment (Deterministic)
+
+11. Rules engine maps (task_types, domain, audience) → persona:
+
+Example mappings:
+
+code|design + software → Software Architect
+
+analyze|extract + data_science → Data Scientist
+
+write|plan + marketing → Marketing Strategist
+
+explain|summarize + academia → Academic Researcher
+
+plan|design + product → Product Manager
+
+QA|explain + students → Teacher/Tutor
+
+
+
+
+12. Persona card (JSON):
+
+name, voice, goals, strengths, caveats
+
+best_practices (checklists), capabilities, style_guidelines.
+
+
+
+13. Tie-breakers: pick highest specificity or weighted by intent confidence.
+
+
+
+Artifacts: persona_card.
+
+
+---
+
+Stage E — Constraint Harmonization & Token Budgeting (Offline)
+
+14. Merge user constraints + slot constraints + system defaults.
+
+
+15. Token/word budgeter:
+
+Estimate size of each prompt section.
+
+Adjust verbosity knobs to fit max_output_tokens for the target generation model (the next model that will use this prompt).
+
+
+
+
+Artifacts: merged_constraints, token_plan.
+
+
+---
+
+Stage F — Prompt Assembly (Offline)
+
+16. Template render a long, structured prompt with these sections (omit irrelevant):
+
+1. System Role & Persona
+
+
+2. Objective
+
+
+3. Context / Background
+
+
+4. Exact Requirements (task, topic, goal, scope)
+
+
+5. Audience & Tone
+
+
+6. Domain Best Practices (persona checklist)
+
+
+7. Constraints (format, citations, tools, timeframe, do-nots)
+
+
+8. Data Provided (quoted or summarized)
+
+
+9. Step-by-Step Plan (how the model should reason)
+
+
+10. Output Schema / Example
+
+
+11. Assumptions (due to missing info)
+
+
+12. Quality Bar / Acceptance Criteria
+
+
+13. Self-Check Rubric
+
+
+
+
+17. Sanity checks:
+
+Completeness (all critical slots addressed)
+
+Conflicts (tone vs. audience)
+
+Safety re-check (no banned content)
+
+Token estimate OK
+
+
+
+
+Artifacts: draft_prompt.
+
+
+---
+
+Stage G — LLM Optimizer (Local or Cloud; Optional)
+
+18. Routing policy (configurable):
+
+If offline_only=true → skip.
+
+Else choose local LLM (e.g., llama.cpp) if available and fast; otherwise cloud provider by cost/latency budget, privacy flags, and content type.
+
+
+
+19. Optimization prompt (meta-prompt):
+
+“Rewrite and enhance the following structured prompt. Preserve intent, structure, and constraints. Improve clarity, add missing connective phrasing, and ensure the persona voice is consistent. Do not remove sections. Keep all bullets.”
+
+
+
+20. Post-process:
+
+Validate no sections were dropped and constraints preserved.
+
+If validation fails → fall back to draft_prompt.
+
+
+
+
+Artifacts: optimized_prompt.
+
+
+---
+
+Stage H — Output & Telemetry
+
+21. Return:
+
+optimized_prompt (ready to use with the target model)
+
+metadata (intents, slots, persona, assumptions, clarifications, token plan, routing decisions, timings)
+
+
+
+22. Emit metrics/logs (PII-safe): latency per stage, cost, model chosen, confidence scores, A/B bucket.
+
+
+
+
+---
+
+4) Core Algorithms (Pseudo/Detail)
+
+4.1 Preprocess
+
+function preprocess(text):
+  t = trim_spaces(text)
+  t = normalize_punctuation(t)
+  (lang, lang_conf) = detect_language(t)
+  safety_flags = light_safety_scan(t)
+  return {text: t, lang, lang_conf, safety_flags}
+
+4.2 Intent Detection (Hybrid)
+
+function detect_intent(t, context):
+  local = local_classifiers.predict(t)  // returns labels + scores
+  intents = calibrate(local)
+
+  if low_confidence(intents):
+     // Optional cheap LLM confirmation (local tiny LLM or cloud cheap model)
+     intents2 = llm_intent_validator(t, intents)
+     intents = merge(intents, intents2, prefer_higher_confidence=true)
+
+  return intents
+
+4.3 Slot Extraction (Heuristics + NER; fallback LLM IE)
+
+function extract_slots(t, intents, context):
+  slot1 = heuristics_regex_extract(t)
+  slot2 = spacy_ner_extract(t)
+  slots = merge_slots(slot1, slot2)
+
+  critical = critical_slots_for(intents.task_types, intents.output_form)
+  missing = diff(critical, slots)
+
+  if missing and allow_llm_extractor:
+     slots_llm = llm_information_extraction(t, critical)
+     slots = merge_slots(slots, slots_llm)
+
+  clarifications = build_clarification_questions(missing)
+  assumptions = propose_assumptions(missing, t, context)
+  return {slots, clarifications, assumptions}
+
+4.4 Persona Assignment (Rules + Scores)
+
+function assign_persona(intents):
+  candidates = match_rules(intents.task_types, intents.domain, intents.audience)
+  ranked = rank_by_specificity_and_confidence(candidates, intents)
+  persona = top(ranked)
+  return persona_card(persona)
+
+4.5 Constraint Harmonizer & Token Budgeter
+
+function harmonize(constraints_user, slots_constraints, target_model):
+  merged = defaults_for(target_model)
+  merged.update(slots_constraints)
+  merged.update(constraints_user)
+  return merged
+
+function token_budgeter(merged, length_target):
+  words = choose_word_target(length_target, merged.max_tokens)
+  section_allocation = allocate_by_weights(words, section_weights_profile)
+  return {words, section_allocation}
+
+4.6 Prompt Assembly
+
+function render_prompt(persona, intents, slots, assumptions, constraints, token_plan, lang):
+  return TEMPLATE.fill({
+    persona, intents, slots, assumptions,
+    constraints, token_plan, lang
+  })
+
+4.7 LLM Optimizer Routing
+
+function optimize_prompt(draft_prompt, policy):
+  if policy.offline_only: return draft_prompt
+
+  route = choose_route(policy, content=draft_prompt)
+  resp = route.llm.complete(META_PROMPT, draft_prompt)
+  if validate_structure(resp, TEMPLATE.sections):
+     return resp
+  else:
+     return draft_prompt
+
+
+---
+
+5) Data Contracts (Schemas)
+
+5.1 Intents (JSON)
+
+{
+  "task_types": [{"label": "write", "score": 0.92}, {"label": "plan", "score": 0.67}],
+  "domain": {"label": "marketing", "score": 0.81},
+  "tone": {"label": "persuasive", "score": 0.77},
+  "audience": {"label": "investors", "score": 0.70},
+  "output_form": {"label": "slides_outline", "score": 0.69},
+  "length_target": {"label": "long", "words": 1200},
+  "language": {"label": "en", "score": 0.98}
+}
+
+5.2 Slots (JSON)
+
+{
+  "topic": "EV fleet battery health analytics",
+  "goal": "create investor-ready pitch deck outline",
+  "timeframe": "Q4 2025",
+  "constraints": {"format": "markdown", "citations": "optional"},
+  "must_include": ["TAM/SAM/SOM", "unit economics", "competitive moat"],
+  "data_provided": {"text": "We have 3 pilots with logistics fleets", "links": ["[[link:abc123]]"]},
+  "missing_critical": ["raise_amount", "target_geography"]
+}
+
+5.3 Persona Card (JSON)
+
+{
+  "name": "Product Manager (Fundraising)",
+  "voice": "crisp, metrics-first, investor-savvy",
+  "goals": ["clarify value prop", "surface traction", "structure narrative"],
+  "strengths": ["market framing", "story arc", "acceptance criteria"],
+  "caveats": ["avoid technical deep dives unless needed"],
+  "best_practices": [
+    "Lead with problem/impact",
+    "Quantify traction & TAM/SAM/SOM",
+    "Show unit economics and moat"
+  ],
+  "capabilities": ["market sizing checklist", "slide outline patterns"]
+}
+
+5.4 Output (JSON)
+
+{
+  "optimized_prompt": "…long structured prompt…",
+  "metadata": {
+    "intents": { /* as above */ },
+    "slots": { /* as above */ },
+    "persona": { "name": "Product Manager (Fundraising)" },
+    "assumptions": ["Raise target: $2M seed", "Geography: India + SEA"],
+    "clarifications": ["Exact raise target?", "Unit economics?"],
+    "routing": {"optimizer": "local_llm", "fallback": "cloud_openai"},
+    "token_plan": {"words": 1200, "alloc": {"Objective": 60, "Plan": 200, "...": 940}},
+    "timings_ms": {"preprocess": 4, "intent": 15, "extract": 12, "render": 3, "optimize": 180},
+    "cost_estimate_usd": 0.002
+  }
+}
+
+
+---
+
+6) Prompt Template (Expandable)
+
+[System Role & Persona]
+You are {{persona.name}}, a {{intents.domain.label}} expert. Voice: {{persona.voice}}.
+Goals: {{persona.goals | bullets}}. Strengths: {{persona.strengths | bullets}}.
+Follow best practices: {{persona.best_practices | bullets}}.
+
+[High-level Objective]
+{{slots.goal}} about {{slots.topic}}.
+
+[Context / Background]
+{{context | concise}}.
+
+[Exact Requirements]
+- Tasks: {{intents.task_types | comma}}
+- Output Form: {{intents.output_form.label}}
+- Scope/Depth: {{intents.length_target.label}} (≈ {{token_plan.words}} words)
+- Timeframe: {{slots.timeframe}}
+
+[Audience & Tone]
+- Audience: {{intents.audience.label}}
+- Tone: {{intents.tone.label}}
+
+[Constraints]
+- Formatting: {{slots.constraints.format}}
+- Citations: {{slots.constraints.citations}}
+- Tools/Functions available: {{constraints.tools | default("none")}}
+- Do NOT: {{constraints.do_not | bullets}}
+
+[Data Provided]
+{{slots.data_provided | quoted_or_bulleted}}
+
+[Step-by-Step Plan]
+1) Clarify the implicit objective and success metric.
+2) Outline content using {{intents.output_form.label}} structure.
+3) Integrate must-include points: {{slots.must_include | bullets}}.
+4) Embed domain best practices.
+5) Prepare the final output following the schema.
+
+[Output Schema / Example]
+{{constraints.schema_or_example}}
+
+[Assumptions (due to missing info)]
+{{assumptions | bullets}}
+
+[Quality Bar / Acceptance Criteria]
+- Relevance to {{intents.audience.label}}.
+- Completeness: covers required sections and must-include points.
+- Style: {{intents.tone.label}}, readable, scannable.
+- Verification: fact-check any numeric claims if provided.
+
+[Self-check before finalizing]
+- Followed schema and constraints?
+- Integrated all must-include points?
+- Persona voice consistent throughout?
+
+
+---
+
+7) Routing, Fallbacks, and Policies
+
+Routing policy (examples):
+
+offline_only: true → skip optimizer.
+
+prefer_local: try local LLM (llama.cpp/Mistral-7B-instruct). If latency > 1.5s or output invalid → fallback cloud.
+
+prefer_cloud: use cloud if privacy_ok and budget_ok; else local.
+
+
+Fallbacks
+
+Timeout: If optimizer exceeds T_opt → return draft_prompt.
+
+Invalid structure: If sections missing → return draft_prompt.
+
+Rate limit: Retry w/ backoff; if still failing → draft_prompt.
+
+
+Cost Control
+
+Token caps per request, daily budget, provider priority list.
+
+Use compression in META_PROMPT (short, strict instructions).
+
+
+Privacy
+
+Redact PII in logs.
+
+Offer private_mode (no cloud calls; local only).
+
+Encrypt at rest any saved prompt libraries.
+
+
+
+---
+
+8) Observability & Evaluation
+
+Metrics
+
+Stage latencies, CPU usage, memory (local models).
+
+LLM call count, tokens in/out, $ cost.
+
+Intent confidence, % requiring optimizer, % fallbacks.
+
+User feedback rating (thumbs up/down).
+
+Prompt acceptance rate (user used as-is vs edited).
+
+
+A/B Testing
+
+Compare optimizer variants (local vs cloud meta-prompt changes).
+
+Measure downstream LLM answer quality (human eval or heuristic scores).
+
+
+Logging
+
+PII-safe payloads.
+
+Structured logs (JSON) with request ID & session ID.
+
+
+
+---
+
+9) Implementation Options
+
+Languages/Frameworks
+
+Python: FastAPI (API), spaCy (NER), scikit/onnxruntime for classifiers, Jinja2 (templating).
+
+TypeScript/Node: Express/NestJS, HuggingFace.js or ONNX Runtime Web, Handlebars.
+
+Local LLM: llama.cpp, ollama, vLLM (GPU), GPT4All.
+
+Cloud LLM: OpenAI, Anthropic, Google, Mistral (use abstraction interface).
+
+
+Local Classifiers
+
+Multi-label intent: MiniLM or DistilBERT fine-tuned; export to ONNX for CPU.
+
+Language detection: fastText/langid.
+
+NER: spaCy small model.
+
+
+Packaging
+
+Dockerized services; models volume-mounted.
+
+Config via YAML (routing, thresholds, provider keys, section weights).
+
+
+
+---
+
+10) Config Examples (YAML)
+
+routing:
+  offline_only: false
+  preference: prefer_local
+  optimizer_timeout_ms: 2500
+  budget_daily_usd: 1.50
+
+thresholds:
+  lang_conf: 0.60
+  intent_conf: 0.55
+
+providers:
+  local_llm:
+    engine: ollama
+    model: mistral:7b-instruct
+    max_tokens: 512
+  cloud_primary:
+    name: openai
+    model: gpt-4o-mini
+    max_tokens: 512
+  cloud_fallback:
+    name: anthropic
+    model: claude-3-haiku
+    max_tokens: 512
+
+sections_weights:
+  role_persona: 0.05
+  objective: 0.05
+  context: 0.10
+  requirements: 0.15
+  audience_tone: 0.05
+  best_practices: 0.10
+  constraints: 0.10
+  data_provided: 0.05
+  plan: 0.15
+  schema: 0.10
+  assumptions: 0.05
+  quality_bar: 0.03
+  self_check: 0.02
+
+
+---
+
+11) Example End-to-End (Concrete)
+
+User input
+“Make a pitch deck for our EV analytics startup. We predict battery health for fleets. Need it investor-ready.”
+
+A. Preprocess
+
+lang = en (0.99)
+
+safety_flags = []
+
+
+B. Intent (local model)
+
+task_types = [design:0.88, write:0.67, plan:0.62]
+
+domain = product/marketing (product:0.72)
+
+tone = persuasive (0.74)
+
+audience = investors (0.77)
+
+output_form = slides_outline (0.81)
+
+length_target = long (1200 words)
+
+
+C. Slots (heuristics + NER)
+
+topic = EV fleet battery health analytics
+
+goal = investor-ready deck outline
+
+must_include = [TAM/SAM/SOM, unit economics, traction, moat]
+
+timeframe = null
+
+missing_critical = [raise_amount, geography, traction_metrics]
+
+
+Clarifications
+
+“What is your target raise?”
+
+“Which markets are you focusing on?”
+
+“What traction metrics (revenue, pilots, retention) can we show?”
+
+
+Assumptions (proceeding)
+
+raise_amount = $2M seed
+
+geography = India + SEA
+
+traction = 3 pilots active
+
+
+D. Persona
+
+Product Manager (Fundraising)
+
+
+E. Constraints & Budget
+
+format = Markdown; citations optional; max_tokens for target LLM = 2000
+
+token_plan allocates ≈1200 words across sections.
+
+
+F. Prompt Assembly
+
+Draft prompt built with all sections, assumptions documented.
+
+
+G. Optimizer
+
+Route → local LLM (Mistral-7B).
+
+Returns refined but structurally identical prompt.
+
+Validate sections OK → accept.
+
+
+H. Output
+
+optimized_prompt returned + metadata (including clarifications & assumptions).
+
+
+
+---
+
+12) Security, Privacy, & Compliance
+
+PII redaction: hash emails/phones/URLs in logs.
+
+No cloud unless allowed: private_mode flag enforces offline path.
+
+Policy adapter: configurable safety regex/keywords; add model-provider policies for cloud calls.
+
+Data retention: prompt texts expire or are anonymized after N days.
+
+
+
+---
+
+13) Performance & Scaling
+
+Cache language & intent results per session.
+
+Warm up local models at boot; ONNX for CPU speed.
+
+Batch LLM optimizer calls if queuing multiple prompts.
+
+Circuit breaker: if local LLM overloaded → cloud, else skip optimization.
+
+
+
+---
+
+14) Testing & QA
+
+Unit tests: classifiers, parser, renderer, validator.
+
+Golden prompts: fixed inputs with expected structured prompts.
+
+Mutation tests: missing slots, conflicting tones, multilingual input.
+
+Load tests: concurrency with local models.
+
+Human eval: rate clarity, completeness, persona consistency.
+
+
+
+---
+
+15) Developer Interfaces (Minimal)
+
+Orchestrator API
+
+POST /v1/build-prompt
+{
+  "user_text": "...",
+  "context": {...},
+  "target_model": "gpt-4o",
+  "constraints": {...},
+  "policy": {"offline_only": false, "preference": "prefer_local"}
+}
+→
+{
+  "optimized_prompt": "...",
+  "metadata": {...}
+}
+
+Persona Library (JSON)
+
+Easily edited by non-engineers; versioned.
+
+
+Templates
+
+Jinja2/Handlebars with section toggles & language support.
+
+
+
+---
+
+TL;DR
+
+Offline first: classify intent, extract slots, pick persona, assemble a long structured prompt.
+
+Hybrid polish: optionally run a local or cloud LLM to refine wording while locking structure.
+
+Deterministic + explainable: rules, confidences, assumptions, and clarifications are all returned in metadata.
+
+Robust: routing, fallbacks, safety, observability, and cost controls are built in.
+
+
+If you wa
+[22-08-2025 08:38] Pavan: awesome—let’s take the hybrid system from “spec” to something you can build and ship. below is a deep-dive continuation with reference code skeletons, example configs, meta-prompts, validators, and test cases so you can stand this up quickly and iterate.
+
+
+---
+
+16) reference implementation (python, modular)
+
+> goal: a clean, readable baseline you can expand. it runs offline-first, with a pluggable optimizer that can use a local LLM (ollama/llama.cpp) or a cloud LLM.
+
+
+
+16.1 project layout
+
+promptgen/
+  app.py                    # FastAPI service (optional)
+  core/
+    orchestrator.py
+    preprocess.py
+    intent.py
+    slots.py
+    persona.py
+    render.py
+    optimize.py
+    safety.py
+    validate.py
+    budget.py
+  data/
+    personas.json
+    sections.yml
+    config.yml
+    critical_slots.yml
+    patterns.yml
+  templates/
+    long_structured_prompt.j2
+  tests/
+    test_end_to_end.py
+    fixtures.json
+  vendor/
+    models/                 # local ONNX/spaCy models
+
+16.2 orchestrator (core/orchestrator.py)
+
+from .preprocess import preprocess
+from .intent import detect_intent
+from .slots import extract_slots
+from .persona import assign_persona
+from .budget import harmonize_constraints, token_budget
+from .render import render_prompt
+from .optimize import optimize_prompt
+from .validate import validate_prompt
+from .safety import prefilter_safety
+
+def build_prompt(user_text, context=None, target_model="gpt-4o", constraints=None, policy=None):
+    context = context or {}
+    constraints = constraints or {}
+    policy = policy or {"offline_only": False, "preference": "prefer_local"}
+
+    pre = preprocess(user_text)
+    safety = prefilter_safety(pre["text"])
+    if safety.get("blocked"):
+        return {"optimized_prompt": safety["refusal_scaffold"], "metadata": {"safety": safety}}
+
+    intents = detect_intent(pre["text"], context=context)
+    slots = extract_slots(pre["text"], intents=intents, context=context)
+
+    persona = assign_persona(intents)
+    merged_constraints = harmonize_constraints(constraints, slots.get("constraints"), target_model)
+    tplan = token_budget(merged_constraints, intents["length_target"])
+
+    draft_prompt = render_prompt(
+        persona=persona,
+        intents=intents,
+        slots=slots,
+        assumptions=slots.get("assumptions", []),
+        constraints=merged_constraints,
+        token_plan=tplan,
+        lang=pre["lang"]
+    )
+
+    issues = validate_prompt(draft_prompt)
+    if issues.get("invalid"):
+        # minimal repair: remove stray markup or re-render with shorter sections
+        draft_prompt = issues["patched_prompt"]
+
+    optimized = optimize_prompt(draft_prompt, policy=policy)
+    return {
+        "optimized_prompt": optimized["text"],
+        "metadata": {
+            "intents": intents,
+            "slots": slots,
+            "persona": {"name": persona["name"]},
+            "routing": optimized["routing"],
+            "token_plan": tplan,
+            "safety": safety
+        }
+    }
+
+
+---
+
+17) preprocessing & safety
+
+17.1 preprocess (core/preprocess.py)
+
+import re
+from langid import classify
+
+def normalize(text: str) -> str:
+    t = text.strip()
+    t = re.sub(r"[ \t]+", " ", t)
+    t = t.replace("“", '"').replace("”", '"').replace("’", "'")
+    return t
+
+def preprocess(text: str):
+    t = normalize(text)
+    lang, conf = classify(t)  # offline language id
+    return {"text": t, "lang": lang, "lang_conf": conf}
+
+17.2 safety prefilter (core/safety.py)
+
+import re
+
+BLOCK_PATTERNS = [
+    r"\bhow to make (?:explosives|bombs)\b",
+    r"\bcredit card numbers?\b",
+]
+
+REFUSAL = """Your request triggers safety limits. Provide a legitimate, safe, and lawful objective...
+Return a revised, safe prompt schema for the intended goal (no prohibited content)."""
+
+def prefilter_safety(text: str):
+    for pat in BLOCK_PATTERNS:
+        if re.search(pat, text, flags=re.I):
+            return {"blocked": True, "reason": pat, "refusal_scaffold": REFUSAL}
+    return {"blocked": False}
+
+
+---
+
+18) intent detection (offline-first, hybrid)
+
+18.1 heuristics + tiny model (core/intent.py)
+
+from collections import defaultdict
+
+TASK_KEYWORDS = {
+    "write": ["write", "blog", "article", "post", "story"],
+    "summarize": ["summarize", "tl;dr", "condense"],
+    "plan": ["plan", "roadmap", "strategy"],
+    "design": ["design", "wireframe", "architecture", "deck"],
+    "code": ["code", "script", "function", "bug", "fix"],
+    "analyze": ["analyze", "analysis", "insight", "report"],
+    "explain": ["explain", "teach", "tutorial", "for beginners"],
+    "QA": ["questions", "quiz", "test me"]
+}
+
+DOMAIN_KEYWORDS = {
+    "software": ["api", "microservice", "frontend", "backend", "react", "python"],
+    "marketing": ["brand", "campaign", "copy", "ad", "seo"],
+    "product": ["roadmap", "PRD", "MVP", "user story"],
+    "data_science": ["dataset", "model", "regression", "A/B", "metrics"],
+    "finance": ["ROI", "P&L", "cashflow", "valuation"],
+    "academia": ["citation", "paper", "abstract", "thesis", "references"],
+    "legal": ["contract", "clause", "compliance", "gdpr"]
+}
+
+FORM_HINTS = {
+    "slides_outline": ["deck", "slides", "pitch deck", "presentation"],
+    "blog_post": ["blog", "article", "post"],
+    "report": ["report", "whitepaper", "analysis"],
+    "table": ["table", "tabulate", "matrix"],
+    "json": ["json", "schema", "structured"],
+    "code_file": ["code", "script", "function"]
+}
+
+def score_from_keywords(text: str, mapping: dict):
+    scores = defaultdict(float)
+    low = text.lower()
+    for label, kws in mapping.items():
+        for kw in kws:
+            if kw in low:
+                scores[label] += 1.0
+    return scores
+
+def detect_intent(text: str, context=None):
+    task_scores = score_from_keywords(text, TASK_KEYWORDS)
+    domain_scores = score_from_keywords(text, DOMAIN_KEYWORDS)
+    form_scores = score_from_keywords(text, FORM_HINTS)
+
+    def top(d, default, thresh=0.0):
+        if not d: return {"label": default, "score": 0.0}
+        label = max(d, key=d.get)
+        return {"label": label, "score": float(d[label])}
+
+    task_sorted = sorted(task_scores.items(), key=lambda x: -x[1])[:3]
+    task_types = [{"label": k, "score": float(v)} for k, v in task_sorted] or [{"label":"write","score":0.0}]
+
+    intents = {
+        "task_types": task_types,
+        "domain": top(domain_scores, "general"),
+        "tone": {"label": "neutral", "score": 0.5},
+        "audience": {"label": "general", "score": 0.5},
+        "output_form": top(form_scores, "blog_post"),
+        "length_target": {"label": "long", "words": 1200},
+        "language": {"label": "en", "score": 1.0}
+    }
+
+    # if confidence low, optionally call LLM validator (local or cloud)
+    # (left as hook)
+    return intents
+
+> upgrade path: swap keyword heuristics with an ONNX MiniLM multilabel classifier.
+
+
+
+
+---
+
+19) slot extraction (heuristics + spaCy; LLM fallback)
+
+19.1 patterns & critical slots
+
+data/critical_slots.yml
+
+investor_pitch:
+  critical: ["raise_amount", "geography", "traction_metrics"]
+blog_post:
+  critical: ["topic", "audience_level"]
+code_fix:
+  critical: ["language", "error_message", "expected_behavior"]
+
+data/patterns.yml (examples)
+
+timeframe:
+  - "(Q[1-4] ?20\\d{2})"
+  - "(20\\d{2}-20\\d{2})"
+money:
+  - "\\$\\s?\\d+(?:\\.\\d+)?\\s?(?:[kKmMbB])?"
+links:
+  - "https?://\\S+"
+
+19.2 extractor (core/slots.py)
+
+import re, yaml, json, os
+import spacy
+NLP = spacy.load("en_core_web_sm")  # offline small model
+
+def load_yaml(path):
+    with open(path, "r") as f: return yaml.safe_load(f)
+
+CRITICAL = load_yaml("data/critical_slots.yml")
+PATTERNS = load_yaml("data/patterns.yml")
+
+def find_patterns(text, name):
+    res = []
+    for pat in PATTERNS.get(name, []):
+        for m in re.finditer(pat, text, flags=re.I):
+            res.append(m.group(0))
+    return list(set(res))
+
+def heuristics(text):
+    topic = None
+    first_sent = text.strip().split(".")[0]
+    if len(first_sent) < 180:
+        topic = first_sent
+    timeframe = find_patterns(text, "timeframe")
+    links = find_patterns(text, "links")
+
+    return {
+        "topic": topic,
+        "timeframe": timeframe[0] if timeframe else None,
+        "data_provided": {"links": links} if links else {}
+    }
+
+def ner_extract(text):
+    doc = NLP(text)
+    ents = {"ORG": [], "GPE": [], "MONEY": []}
+    for e in doc.ents:
+        if e.label_ in ents:
+            ents[e.label_].append(e.text)
+    constraints = {}
+    if ents["MONEY"]:
+        constraints["budget"] = list(set(ents["MONEY"]))[0]
+    return {"entities": ents, "constraints": constraints}
+
+def critical_for(intents):
+    label = intents["output_form"]["label"]
+    if label in CRITICAL:
+        return CRITICAL[label]["critical"]
+    # special-case by task/domain
+    if any(t["label"] == "design" for t in intents["task_types"]):
+        return ["scope", "audience"]
+    return []
+
+def build_clarifications(missing):
+    return [f"Please provide: {m.replace('_',' ')}." for m in missing]
+
+def propose_assumptions(missing, text, context):
+    # simplistic defaults; replace with domain heuristics
+    assum = []
+    for m in missing:
+        if m == "raise_amount": assum.append("Assume seed raise target = $2M.")
+        elif m == "geography": assum.append("Assume primary market = India & SEA.")
+        elif m == "traction_metrics": assum.append("Assume 3 active pilots, early revenue.")
+        else: assum.append(f"Assume a reasonable default for {m}.")
+    return assum
+
+def extract_slots(text, intents, context=None):
+    h = heuristics(text)
+    n = ner_extract(text)
+    slots = {**h}
+    slots["constraints"] = n["constraints"]
+    # determine critical
+    critical = critical_for(intents)
+    present = set(k for k,v in slots.items() if v)
+    missing = [c for c in critical if c not in present]
+    clarifications = build_clarifications(missing) if missing else []
+    assumptions = propose_assumptions(missing, text, context) if missing else []
+    slots["must_include"] = context.get("must_include", [])
+    slots["assumptions"] = assumptions
+    slots["clarifications"] = clarifications
+    return slots
+
+
+---
+
+20) persona engine (deterministic rules)
+
+data/personas.json
+
+[
+  {
+    "id": "software_architect",
+    "name": "Software Architect",
+    "match": {"task_any": ["code","design"], "domain_any": ["software"]},
+    "voice": "precise, pragmatic, systems-first",
+    "best_practices": [
+      "State constraints and trade-offs.",
+      "Prefer simple, testable designs.",
+      "Document interfaces and failure modes."
+    ]
+  },
+  {
+    "id": "product_manager_fundraising",
+    "name": "Product Manager (Fundraising)",
+    "match": {"task_any": ["design","write","plan"], "audience_any": ["investors","executive"]},
+    "voice": "crisp, metrics-first, investor-savvy",
+    "best_practices": [
+      "Lead with problem and quantified impact.",
+      "Show traction and market size.",
+      "Explain unit economics and moat."
+    ]
+  },
+  {
+    "id": "teacher_tutor",
+    "name": "Teacher / Tutor",
+    "match": {"task_any": ["explain","QA"], "audience_any": ["students","general"]},
+    "voice": "clear, friendly, scaffolded examples",
+    "best_practices": [
+      "Use simple language before formal terms.",
+      "Include examples and quick checks.",
+      "Progress from basics to applications."
+    ]
+  }
+]
+
+core/persona.py
+
+import json
+
+with open("data/personas.json","r") as f:
+    PERSONAS = json.load(f)
+
+def assign_persona(intents):
+    tasks = {t["label"] for t in intents["task_types"]}
+    dom = intents["domain"]["label"]
+    aud = intents["audience"]["label"]
+    candidates = []
+    for p in PERSONAS:
+        m = p["match"]
+        score = 0
+        if "task_any" in m and tasks.intersection(m["task_any"]): score += 1
+        if "domain_any" in m and dom in m["domain_any"]: score += 1
+        if "audience_any" in m and aud in m["audience_any"]: score += 1
+        if score: candidates.append((score, p))
+    if not candidates:
+        return {"name":"General Expert", "voice":"neutral, helpful", "best_practices":[]}
+    candidates.sort(key=lambda x: -x[0])
+    return candidates[0][1]
+
+
+---
+
+21) token budgeting & rendering
+
+core/budget.py
+
+def harmonize_constraints(user_constraints, slot_constraints, target_model):
+    defaults = {
+        "format": "markdown",
+        "citations": "optional",
+        "schema_or_example": "Return Markdown with the sections requested.",
+        "max_tokens": 2000,
+        "tools": []
+    }
+    merged = {**defaults, **(slot_constraints or {}), **(user_constraints or {})}
+    merged["target_model"] = target_model
+    return merged
+
+WEIGHTS = {
+  "role":0.06,"objective":0.05,"context":0.10,"requirements":0.15,
+  "audience_tone":0.05,"best_practices":0.10,"constraints":0.08,
+  "data":0.05,"plan":0.16,"schema":0.10,"assumptions":0.06,"quality":0.02,"selfcheck":0.01
+}
+
+def token_budget(constraints, length_target):
+    words = length_target.get("words", 1200)
+    alloc = {k:int(words*v) for k,v in WEIGHTS.items()}
+    return {"words": words, "alloc": alloc}
+
+templates/long_structured_prompt.j2 (excerpt)
+
+[System Role & Persona]
+You are {{ persona.name }}. Voice: {{ persona.voice }}.
+Follow best practices:
+{% for bp in persona.best_practices %}- {{ bp }}
+{% endfor %}
+
+[High-level Objective]
+{{ slots.get("goal", "Clarify and complete the user's objective") }} about {{ slots.get("topic","<topic>") }}.
+
+[Context / Background]
+{{ context | default("Use only the information provided by the user and assumptions below.") }}
+
+[Exact Requirements]
+- Tasks: {% for t in intents.task_types %}{{ t.label }}{% if not loop.last %}, {% endif %}{% endfor %}
+- Output form: {{ intents.output_form.label }}
+- Scope depth: {{ intents.length_target.label }} (~{{ token_plan.words }} words)
+- Timeframe: {{ slots.timeframe | default("unspecified") }}
+
+[Audience & Tone]
+- Audience: {{ intents.audience.label }}
+- Tone: {{ intents.tone.label }}
+
+[Constraints]
+- Formatting: {{ constraints.format }}
+- Citations: {{ constraints.citations }}
+- Tools/Functions available: {{ constraints.tools | default([]) }}
+- Do NOT: avoid hallucinations; avoid unverifiable claims.
+
+[Data Provided]
+{{ slots.data_provided | default({}) }}
+
+[Step-by-Step Plan]
+1) Clarify objective and success metric.
+2) Outline content for {{ intents.output_form.label }}.
+3) Integrate must-include points: {{ slots.must_include | default([]) }}.
+4) Apply persona best practices.
+5) Produce final output per schema.
+
+[Output Schema / Example]
+{{ constraints.schema_or_example }}
+
+[Assumptions (due to missing info)]
+{% for a in slots.assumptions %}- {{ a }}
+{% endfor %}
+
+[Quality Bar / Acceptance Criteria]
+- Relevance: 100% to audience.
+- Completeness: covers all required sections.
+- Style: adheres to tone; scannable.
+- Verification: flag uncertain facts.
+
+[Self-check before finalizing]
+- Schema followed?
+- All must-include points integrated?
+- Persona voice consistent?
+
+core/render.py
+
+from jinja2 import Environment, FileSystemLoader
+
+env = Environment(loader=FileSystemLoader("templates"), trim_blocks=True, lstrip_blocks=True)
+
+def render_prompt(persona, intents, slots, assumptions, constraints, token_plan, lang):
+    template = env.get_template("long_structured_prompt.j2")
+    slots = dict(slots)
+    slots["assumptions"] = assumptions or []
+    return template.render(
+        persona=persona,
+        intents=intents,
+        slots=slots,
+        constraints=constraints,
+        token_plan=token_plan,
+        context=""
+    )
+
+
+---
+
+22) optimizer (local or cloud) + meta-prompt and validation
+
+22.1 meta-prompt (strict)
+
+You are a prompt optimizer. Input is a structured prompt with mandatory sections.
+Goal: Improve clarity, cohesion, and persona voice WITHOUT adding or removing sections,
+and WITHOUT changing constraints, schema, or assumptions.
+
+Rules:
+- Preserve all section headers and bullet counts.
+- Rephrase sentences for clarity; keep the same meaning.
+- Do not invent data; do not remove assumptions or constraints.
+- Keep language in the same language as the input.
+
+Return ONLY the improved prompt text.
+
+22.2 optimizer (core/optimize.py)
+
+import re
+from .validate import sections_present
+
+def call_local_llm(prompt: str) -> str:
+    # Example: subprocess to ollama run mistral:7b-instruct -p "<meta>\n\n<draft>"
+    # Here we just return the same prompt for placeholder.
+    return prompt
+
+def call_cloud_llm(prompt: str, provider="openai", model="gpt-4o-mini"):
+    # Placeholder; integrate SDK and pass meta-prompt + draft as input
+    return prompt
+
+def optimize_prompt(draft_prompt: str, policy: dict):
+    offline_only = policy.get("offline_only", False)
+    preference = policy.get("preference", "prefer_local")
+
+    text_out = draft_prompt
+    routing = {"optimizer": "none", "fallback": None}
+
+    if offline_only:
+        return {"text": text_out, "routing": routing}
+
+    # primary route
+    try:
+        if preference == "prefer_local":
+            text_out = call_local_llm(draft_prompt)
+            routing["optimizer"] = "local_llm"
+        else:
+            text_out = call_cloud_llm(draft_prompt)
+            routing["optimizer"] = "cloud_llm"
+    except Exception:
+        # fallback
+        try:
+            if routing["optimizer"] == "local_llm":
+                text_out = call_cloud_llm(draft_prompt)
+                routing["fallback"] = "cloud_llm"
+            else:
+                text_out = call_local_llm(draft_prompt)
+                routing["fallback"] = "local_llm"
+        except Exception:
+            text_out = draft_prompt
+            routing["fallback"] = "none"
+
+    # validate: ensure mandatory sections still present
+    if not sections_present(text_out):
+        text_out = draft_prompt
+        routing["note"] = "validation_failed"
+
+    return {"text": text_out, "routing": routing}
+
+22.3 structure validator (core/validate.py)
+
+MANDATORY_HEADERS = [
+  r"\[System Role & Persona\]",
+  r"\[High-level Objective\]",
+  r"\[Exact Requirements\]",
+  r"\[Audience & Tone\]",
+  r"\[Constraints\]",
+  r"\[Step-by-Step Plan\]",
+  r"\[Output Schema / Example\]",
+  r"\[Quality Bar / Acceptance Criteria\]",
+  r"\[Self-check before finalizing\]"
+]
+
+def sections_present(text: str) -> bool:
+    import re
+    for h in MANDATORY_HEADERS:
+        if not re.search(h, text):
+            return False
+    return True
+
+def validate_prompt(text: str):
+    ok = sections_present(text)
+    if ok:
+        return {"invalid": False}
+    # minimal patch (example): re-append missing headers at end
+    missing = [h for h in MANDATORY_HEADERS if h not in text]
+    patched = text + "\n\n" + "\n".join([re.sub(r"\\","",h) for h in missing])
+    return {"invalid": True, "patched_prompt": patched}
+
+
+---
+
+23) API server (optional) – FastAPI (app.py)
+
+from fastapi import FastAPI
+from pydantic import BaseModel
+from core.orchestrator import build_prompt
+
+app = FastAPI()
+
+class Req(BaseModel):
+    user_text: str
+    context: dict | None = None
+    target_model: str | None = "gpt-4o"
+    constraints: dict | None = None
+    policy: dict | None = None
+
+@app.post("/v1/build-prompt")
+def api_build(req: Req):
+    return build_prompt(
+        user_text=req.user_text,
+        context=req.context,
+        target_model=req.target_model,
+        constraints=req.constraints,
+        policy=req.policy
+    )
+
+
+---
+
+24) deployment & ops
+
+local dev: uvicorn app:app --reload
+
+docker: bake ONNX/spaCy models into the image, mount persona/critical slots as config volume.
+
+observability: wrap LLM calls with timing + token logs; redact PII.
+
+feature flags: offline_only, provider priorities, budget caps per day.
+
+
+
+---
+
+25) recommended offline models & tooling
+
+Language ID: langid or fastText lid.176
+
+NER: en_core_web_sm (spaCy) → upgrade to md if CPU allows
+
+Intent classifier: start with heuristics → upgrade to MiniLM/DistilBERT fine-tuned; export to ONNX Runtime for fast CPU inference
+
+Local LLM: Ollama (Mistral 7B Instruct, Llama 3.1 8B Instruct) for polish step
+
+Cloud fallback: OpenAI gpt-4o-mini / Anthropic Haiku / Mistral Small
+
+
+
+---
+
+26) eval
+[22-08-2025 13:52] Pavan: SUPER MASTER PROMPT — PromptPilot (Hybrid Offline+Online Dynamic Prompt Builder)
+— paste this into your agent as-is to generate the runnable demo site and the core “heart of the system” engine —
+
+Objective
+Build a minimal-but-professional Flask demo web app that showcases the heart of PromptPilot: offline-first dynamic intent recognition, slot extraction, persona assignment, and master-prompt assembly with optional online LLM polishing + multi-provider fallback. The app must support mid-conversation (in-chat) prompting, two generation modes (Basic vs Complex), strict/privacy modes, and .env-based configuration. Deliver a complete, copy-paste-ready codebase with instructions and tests.
+
+Scope & Non-Goals
+Do implement: the orchestration pipeline, offline heuristics, persona rules + dynamic synthesis, schema-free prompt rendering (when Basic), structured sectioned prompt rendering (when Complex), optional online optimizer with fallback chain (OpenAI → Anthropic → Gemini → local/skip), black theme demo UI, logging, and unit tests.
+Do not implement: heavy DB/analytics, multi-tenant billing, or advanced auth flows. Keep it single-user demo-grade, but production-minded.
+
+Key Behaviors to Implement
+
+1. Offline-first pipeline (must run with ZERO API keys):
+
+
+
+normalize + language detect (lightweight, rule/regex-based acceptable for demo)
+
+light safety gate (regex list for prohibited categories; return a safe refusal scaffold if triggered)
+
+intent detection (multi-label heuristic using keywords + patterns + small dictionaries; allow override via query param intent_hint)
+
+slot extraction (regex + simple NER-like rules for topic, goal, constraints, must_include, timeframe)
+
+persona assignment (deterministic rule mapping from {task_types, domain, audience}; if OOD, synthesize a compact persona from user text using a local template)
+
+assumptions & clarifications (compute critical slots; if missing → add up to 3 explicit assumptions unless strict=true, in which case output clarifying questions)
+
+two rendering modes:
+• Basic → clean, compact, non-heading instruction (no “Objective/Context” labels)
+• Complex → structured prompt sections (Role, Objective, Context, Instructions, Output Format, Clarifying Questions, Tone & Length)
+
+mid-conversation support: accept an array of {role, content, ts}; build a concise context summary (last N turns + salient entities), then run the same pipeline on the latest user turn.
+
+
+2. Optional Online Optimizer (only if keys exist):
+
+
+
+Provider abstraction with ordered fallback: OPENAI_API_KEY → ANTHROPIC_API_KEY → GEMINI_API_KEY → local/skip.
+
+Timeout + circuit breaker + retry (exponential backoff).
+
+Optimizer meta-prompt: “Rewrite and enhance the following prompt while preserving all constraints and sections. Do not drop required details. Improve clarity and flow.”
+
+Post-validation: ensure required sections (in Complex) or key constraints (in Basic) still present; if not, return the unoptimized draft.
+
+
+3. Privacy & Safety:
+
+
+
+Never send user text to cloud if PRIVATE_MODE=true or no keys present.
+
+Redact emails/phones/URLs in logs (hash or placeholder).
+
+Configurable blocked topics list; return safe scaffold when triggered.
+
+.env only; never hardcode secrets; include .env.example; respect STRICT_MODE, PRIVATE_MODE, MAX_TOKENS, PROVIDER_ORDER.
+
+
+4. Telemetry & Testing:
+
+
+
+Structured JSON logs (request_id, stage timings, selected route, fallback used).
+
+Minimal unit tests for: intent detection, slot extraction, persona assignment, prompt rendering (Basic & Complex), optimizer routing.
+
+A “Determinism Mode” that fixes seed and disables timestamps in outputs for test comparability.
+
+
+Deliverables (file tree and required contents)
+Create this exact structure and fill every file with complete, runnable code:
+
+promptpilot/
+├─ app.py                                  # Flask app, routes, Jinja, static serving
+├─ orchestrator/
+│  ├─ init.py
+│  ├─ pipeline.py                           # main state machine orchestrator
+│  ├─ nlp_offline.py                        # normalize, lang detect, safety, intents, slots
+│  ├─ persona.py                            # rules engine + dynamic synthesis stub
+│  ├─ renderer.py                           # Basic & Complex prompt renderers
+│  ├─ optimizer.py                          # provider abstraction + fallbacks + validation
+│  ├─ utils.py                              # helpers: logging, ids, redaction, config
+│  └─ constants.py                          # keywords, patterns, blocked topics, defaults
+├─ providers/
+│  ├─ init.py
+│  ├─ openai_provider.py
+│  ├─ anthropic_provider.py
+│  ├─ gemini_provider.py
+│  └─ local_provider.py                     # no-op or local llama.cpp hook (stubbed)
+├─ templates/
+│  ├─ base.html
+│  ├─ index.html                            # black-theme UI: input, mode toggle (Basic/Complex), privacy/strict switches, conversation editor
+│  ├─ result.html                           # shows generated prompt + metadata
+│  └─ error.html                            # friendly error page
+├─ static/
+│  ├─ css/black.css                         # modern black theme; responsive
+│  └─ js/app.js                             # client helpers; spinner; copy-to-clipboard
+├─ tests/
+│  ├─ test_intent.py
+│  ├─ test_slots.py
+│  ├─ test_persona.py
+│  ├─ test_renderer.py
+│  └─ test_optimizer.py
+├─ .env.example                             # config skeleton, see below
+├─ requirements.txt                         # Flask, python-dotenv, etc. (lightweight)
+├─ README.md                                # how to run
+└─ run.sh                                   # convenience run script
+
+Environment (.env.example — fill with placeholders; app must run without any keys)
+FLASK_ENV=development
+SECRET_KEY=change-me
+PRIVATE_MODE=true                 # true → never call cloud
+STRICT_MODE=false                 # true → ask clarifying Qs instead of assuming
+MAX_TOKENS=1200                   # guidance for prompt length budgeting
+PROVIDER_ORDER=openai,anthropic,gemini,local
+OPENAI_API_KEY=
+ANTHROPIC_API_KEY=
+GEMINI_API_KEY=
+OPTIMIZER_TIMEOUT_MS=2500
+
+Endpoints & Behaviors (implement exactly)
+GET / → render index page.
+POST /build
+
+JSON body:
+{
+"user_text": str,
+"mode": "basic" | "complex",
+"conversation": [ { "role": "user|assistant|system", "content": str, "ts": str } ] | null,
+"privacy": bool (override PRIVATE_MODE),
+"strict": bool (override STRICT_MODE),
+"intent_hint": str | null,
+"target_model": str | null
+}
+
+Steps: preprocess → detect intents → extract slots → assign persona → compute assumptions/clarifications → render draft (Basic/Complex) → optional optimize → return JSON
+
+Response JSON:
+{
+"prompt": str,
+"mode": "basic|complex",
+"metadata": {
+"intents": {...}, "slots": {...}, "persona": {...},
+"assumptions": [...], "clarifications": [...],
+"routing": {"optimizer": "openai|anthropic|gemini|local|skipped", "fallback_used": bool},
+"timings_ms": {...}, "privacy_effective": bool
+}
+}
+
+
+Orchestration Algorithm (implement faithfully)
+
+1. Preprocess
+
+
+
+trim spaces; normalize punctuation; strip control chars
+
+language detect (very light heuristic: common stopwords + unicode block); set language='en' if unknown
+
+safety scan (regex lists in constants.py). If violation → return safe_refusal_scaffold prompt (Complex mode: include a “Safety Notice” section; Basic mode: short refusal instruction)
+
+
+2. Intent Detection (offline)
+
+
+
+Multi-label keyword scoring with small dictionaries from constants.py
+task_types: [write, summarize, plan, analyze, classify, extract, translate, code, fix_code, design, brainstorm, explain, compare, QA, evaluate, proofread, email, testcase, prompt_build]
+domain: [software, marketing, product, data_science, academia, legal, finance, healthcare, education, creative, sales, ops, general]
+tone: [formal, concise, friendly, persuasive, technical, storytelling, neutral]
+audience: [executive, technical, general, students, customers, investors]
+output_form: [code_file, guide, report, email, outline, table, json, checklist, roadmap, prompt]
+
+If intent_hint present, merge with +0.2 bias.
+
+Flag low confidence if max score < 0.55 for any dimension; mark ood_candidate=true.
+
+
+3. Slot Extraction (offline)
+
+
+
+topic: first NP-like phrase or quoted text
+
+goal: imperative verb + object pattern (“write/plan/explain …”)
+
+constraints: capture tokens like “in markdown”, “limit to 500 words”, “JSON”, “with examples”, “bcrypt”, etc.
+
+must_include: words after “must include/cover/include:” or comma list after “include”
+
+timeframe: detect “Q\d \d{4}”, month/year, “in 7 days”, etc.
+
+data_provided: quoted blocks or code fences
+
+Determine critical_slots based on intent/output_form (e.g., for code → language, files, run_instructions).
+
+If missing critical and strict=true → populate clarifications[]; else compute up to 3 explicit assumptions[].
+
+
+4. Persona Assignment
+
+
+
+Rule map (examples):
+• code|design + software → “Senior Software Engineer (Secure-first)”
+• analyze|extract + data_science → “Data Scientist (Pragmatic)”
+• write|plan + marketing → “Marketing Strategist (Conversion-focused)”
+• explain|summarize + academia → “Academic Researcher (Clarity-first)”
+• plan|design + product → “Product Manager (Outcome-driven)”
+• QA|explain + students → “Teacher/Tutor (Patient & clear)”
+
+If ood_candidate=true → synthesize persona locally: name (2–4 words), voice (max 8 words), 5 best_practices from detected domain words, 3 do_not rules. (No cloud call in privacy mode.)
+
+
+5. Rendering
+
+
+
+Basic mode: single compact instruction with all necessary details, no headings.
+
+Complex mode: sections (System Role & Persona; Objective; Context; Detailed Instructions; Output Format; Clarifying Questions; Tone & Length).
+
+Always include assumptions when used, clearly labeled.
+
+In-chat: build a brief “Conversation Context” paragraph from last N turns before rendering.
+
+
+6. Optimizer (optional)
+
+
+
+If privacy=false and any provider key present, call optimizer with ordered fallbacks and timeout.
+
+Validate that headings or key constraints remain; otherwise keep draft.
+
+
+7. Return JSON with timings; log PII-safe metrics.
+
+
+
+Rendering Requirements (must)
+Basic (non-heading) template sketch:
+“Act as {persona.name}. {voice}. Generate {task} for {topic}. Include {requirements/constraints}. Audience: {audience}. Tone: {tone}. If {missing critical}, apply assumptions: {assumptions}. Provide clear, copy-paste-ready output.”
+
+Complex (structured) template sketch (sections labels exactly as below):
+
+1. System Role & Persona
+
+
+2. Objective
+
+
+3. Context
+
+
+4. Detailed Instructions
+
+
+5. Output Format
+
+
+6. Clarifying Questions
+
+
+7. Tone & Length
+
+
+8. Assumptions (if any)
+
+
+
+UI Requirements (black theme demo)
+
+Responsive single page: left column (description + toggles), right column (input + conversation editor) on desktop; stacked on mobile.
+
+Controls:
+• textarea for user_text
+• checkbox “In-chat mode” (reveals conversation editor with 3 prefilled example turns)
+• radio “Mode: Basic | Complex” (default Basic)
+• toggle “Privacy mode” (default from .env)
+• toggle “Strict mode” (default from .env)
+• input for optional intent hint
+• Generate button with spinner
+
+Result page shows: final prompt (copy button), metadata (intents, persona, assumptions/clarifications, routing), and a JSON accordion.
+
+
+Examples (the app must include these as unit-testable fixtures)
+Example A — Task (Basic)
+Input: “write a code for login page”
+Expected key traits: persona=Senior Software Engineer; constraints mention hashing (bcrypt), client validation; short, clean instruction; no headings.
+
+Example B — Task (Complex)
+Same input, rendered with sections and clarifying Qs (e.g., “Node or Flask?”).
+
+Example C — Meta/System (Complex)
+Input: “can your algorithm generate prompts mid-conversation? explain.”
+Persona: AI System Designer; Sections: explain how conversation is summarized and integrated; include example.
+
+Example D — In-chat (Basic)
+Conversation:
+
+user: “we’re building a small flask app”
+
+assistant: “great, what feature?”
+
+user: “auth & login form; bcrypt pls”
+Latest turn: “also add remember-me and csrf”
+Output: Basic prompt for code generation referencing context succinctly (include remember-me + CSRF).
+
+
+Acceptance Criteria
+
+Runs locally with only pip install -r requirements.txt and flask run (or run.sh).
+
+With no API keys, all features work except optimizer (which is skipped and annotated in metadata).
+
+Strict mode returns clarifying questions if critical slots missing; non-strict emits explicit assumptions.
+
+Basic vs Complex mode produce visibly different prompt styles.
+
+In-chat mode demonstrably uses prior turns (visible in “Context” or implicit in Basic).
+
+Unit tests pass (≥5 tests) and don’t require network.
+
+No secret committed; .env.example present; .env ignored.
+
+Logs are JSON and exclude raw emails/phones/URLs.
+
+
+Security & Privacy Notes to Implement
+
+Use python-dotenv to load .env.
+
+Ensure SECRET_KEY is used for session/CSRF (Flask-WTF optional; if excluded, note why).
+
+Redact PII in logs: replace emails with [EMAIL], phones with [PHONE], URLs with [[link:hash]].
+
+Respect PRIVATE_MODE; never call providers if true or no key.
+
+Cap optimizer output tokens and enforce timeouts.
+
+
+Dependencies (pin minimal set)
+Flask, Jinja2, python-dotenv, click (optional), itsdangerous, markupsafe.
+Testing: pytest.
+No heavyweight NLP libs required; implement lightweight heuristics as described.
+
+README must include
+
+Setup: create virtualenv, install requirements, copy .env.example → .env, explain keys & privacy mode.
+
+Run: flask --app app run or ./run.sh.
+
+How to test: pytest -q.
+
+How to try examples: paste the four examples and show where toggles are.
+
+
+What to Output (format exactly)
+
+1. A short project overview paragraph.
+
+
+2. A file tree as shown above.
+
+
+3. Full contents of every file in properly labeled code blocks, e.g.:
+File: app.py
+
+# …complete code…
+
+(Do this for every file.)
+
+
+4. A .env.example block with the variables above.
+
+
+5. A step-by-step “How to Run” section.
+
+
+6. A “How it Works” section that maps code modules to the algorithm stages 1–7.
+
+
+7. A “Testing” section explaining each test’s intent.
+
+
+8. A “Security & Privacy” section summarizing how PRIVATE_MODE and redaction work.
+
+
+9. A “Limitations & Next Steps” section (bullet list).
+
+
+Basic vs Complex Rendering Rules (embed in renderer.py)
+
+If mode=basic → no headings; compress to ≤180 words unless MAX_TOKENS suggests longer; keep constraints explicit; avoid narrative prose.
+
+If mode=complex → include all section labels; ~400–900 words depending on MAX_TOKENS; include “Clarifying Questions” (≤2) even if assumptions were filled (mark as optional).
+
+Always keep persona voice consistent (2–3 traits max).
+
+
+Optimizer Validation Rules (embed in optimizer.py)
+
+For complex: assert all section labels present.
+
+For basic: assert presence of {persona mention OR role verb (“Act as …”)}, constraints, audience/tone or default.
+
+If validation fails or timeout → return draft; set routing.optimizer="skipped" and fallback_used=false.
